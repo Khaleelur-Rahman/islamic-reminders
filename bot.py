@@ -20,10 +20,14 @@ Environment variables:
   TELEGRAM_CHAT_ID    your chat id
   GEMINI_API_KEY      from aistudio.google.com (free tier)
   GEMINI_MODEL        optional, default "gemini-flash-lite-latest"
+  DATA_DIR            optional: directory caching the big source datasets
+  HISTORY_FILE        optional, default "history.json": no-repeat memory
   DRY_RUN=1           optional: print the message instead of sending it,
-                      and skip the AI call if GEMINI_API_KEY is unset
+                      skip the AI call if GEMINI_API_KEY is unset, and
+                      don't record anything in the history file
 """
 
+import datetime
 import html
 import json
 import os
@@ -52,6 +56,8 @@ MAX_HADITH_CHARS = 1200        # skip very long narrations
 MAX_TAFSIR_CHARS = 6000        # keep the prompt small
 MAX_AYAH_CHARS = 3000          # Arabic + translation combined, so the message fits
 TELEGRAM_LIMIT = 4096
+HISTORY_FILE = os.environ.get("HISTORY_FILE", "history.json")
+HISTORY_DAYS = 365             # don't repeat an ayah or hadith within this window
 
 
 def get_json(url, data=None, headers=None, attempts=3, base_delay=2, timeout=60):
@@ -77,13 +83,34 @@ def get_json(url, data=None, headers=None, attempts=3, base_delay=2, timeout=60)
 
 # ---------- data ----------
 
-def pick_ayah():
-    translation = get_json(QURAN_TRANSLATION)["quran"]
-    arabic = get_json(QURAN_ARABIC)["quran"]
+def get_dataset(url):
+    """Fetch a big dataset, through a local file cache when DATA_DIR is set."""
+    cache_dir = os.environ.get("DATA_DIR")
+    if not cache_dir:
+        return get_json(url)
+    path = os.path.join(cache_dir, url.rsplit("/", 1)[-1])
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        pass  # not cached yet, or corrupted: fetch and rewrite
+    data = get_json(url)
+    os.makedirs(cache_dir, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+    return data
+
+
+def pick_ayah(skip=frozenset()):
+    translation = get_dataset(QURAN_TRANSLATION)["quran"]
+    arabic = get_dataset(QURAN_ARABIC)["quran"]
     if len(translation) != len(arabic):
         raise RuntimeError("Quran editions are misaligned (different ayah counts)")
     eligible = [i for i in range(len(translation))
-                if len(arabic[i]["text"]) + len(translation[i]["text"]) <= MAX_AYAH_CHARS]
+                if len(arabic[i]["text"]) + len(translation[i]["text"]) <= MAX_AYAH_CHARS
+                and f"{translation[i]['chapter']}:{translation[i]['verse']}" not in skip]
     i = random.choice(eligible)
     t, a = translation[i], arabic[i]
     if (t["chapter"], t["verse"]) != (a["chapter"], a["verse"]):
@@ -102,17 +129,18 @@ def pick_ayah():
     }
 
 
-def hadith_candidates():
+def hadith_candidates(skip=frozenset()):
     key = random.choice(list(HADITH_COLLECTIONS))
     name, url, books = HADITH_COLLECTIONS[key]
     fragment_markers = ("narrated this hadith", "this hadith has been", "same chain",
                         "chain of transmitters", "with a slight variation", "with the addition",
                         "similar hadith", "like this hadith", "the same hadith")
     hadiths = [
-        h for h in get_json(url)["hadiths"]
+        h for h in get_dataset(url)["hadiths"]
         if h["reference"]["book"] in books
         and MIN_HADITH_CHARS < len(h["text"].strip()) <= MAX_HADITH_CHARS
         and not any(m in h["text"].lower() for m in fragment_markers)
+        and f"{key}:{h['hadithnumber']}" not in skip
     ]
     if not hadiths:
         raise RuntimeError(f"no eligible hadith found in {name}")
@@ -123,10 +151,37 @@ def hadith_candidates():
             ref = f"Sahih al-Bukhari {h['hadithnumber']}"
             link = f"https://sunnah.com/bukhari:{h['hadithnumber']}"
         else:
-            ref = f"Sahih Muslim, Book {h['reference']['book']}, Hadith {h['reference']['hadith']}"
-            link = None
-        out.append({"collection": name, "ref": ref, "link": link, "text": h["text"].strip()})
+            # the dataset's hadithnumber is a sequential index, not the sunnah.com
+            # number, so link by sunnah.com's in-book reference instead
+            book, num = h["reference"]["book"], h["reference"]["hadith"]
+            ref = f"Sahih Muslim, Book {book}, Hadith {num}"
+            link = f"https://sunnah.com/muslim/{book}/{num}"
+        out.append({"collection": name, "key": f"{key}:{h['hadithnumber']}",
+                    "ref": ref, "link": link, "text": h["text"].strip()})
     return out
+
+
+# ---------- no-repeat history ----------
+
+def load_history():
+    """Keys of items sent in the last HISTORY_DAYS days, by kind."""
+    try:
+        with open(HISTORY_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError):
+        raw = {}
+    cutoff = (datetime.date.today() - datetime.timedelta(days=HISTORY_DAYS)).isoformat()
+    return {kind: {k: d for k, d in raw.get(kind, {}).items() if d >= cutoff}
+            for kind in ("ayahs", "hadiths")}
+
+
+def save_history(history, ayah_key, hadith_key):
+    today = datetime.date.today().isoformat()
+    history["ayahs"][ayah_key] = today
+    history["hadiths"][hadith_key] = today
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, indent=1, sort_keys=True)
+        f.write("\n")
 
 
 # ---------- AI ----------
@@ -278,17 +333,21 @@ def send(text):
 
 
 def main():
-    ayah = pick_ayah()
-    hadiths = hadith_candidates()
+    history = load_history()
+    ayah = pick_ayah(skip=history["ayahs"])
+    hadiths = hadith_candidates(skip=history["hadiths"])
     r = safe_reflect(ayah, hadiths)
+    chosen = hadiths[r["hadith_index"]]
     # build (and validate) both messages before sending either, so a bad
     # message fails the run instead of sending half the reminder
-    messages = build_messages(ayah, hadiths[r["hadith_index"]], r)
+    messages = build_messages(ayah, chosen, r)
     for m in messages:
         if os.environ.get("DRY_RUN"):
             print(m, "\n" + "-" * 40)
         else:
             send(m)
+    if not os.environ.get("DRY_RUN"):
+        save_history(history, f"{ayah['surah']}:{ayah['ayah']}", chosen["key"])
 
 
 if __name__ == "__main__":

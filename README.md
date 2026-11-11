@@ -27,6 +27,10 @@ After that the schedule (23:00 UTC = 7:00 AM SGT, sometimes 5–15 min late)
 runs on its own. A failed run shows up as a failed Action; if only Gemini
 fails, the texts are still sent, just without the reflection sections.
 
+Each run records what it sent in `history.json` (committed back by the
+workflow) and won't repeat an ayah or hadith within 365 days. The ~13 MB of
+source datasets are cached between runs with `actions/cache`.
+
 ## Local testing
 
 ```bash

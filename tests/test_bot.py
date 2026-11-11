@@ -104,6 +104,14 @@ def test_pick_ayah_survives_tafsir_outage(monkeypatch):
     assert bot.pick_ayah()["tafsir"] == ""
 
 
+def test_pick_ayah_skips_recently_sent(monkeypatch):
+    monkeypatch.setattr(bot, "get_json", fake_get_json(quran_mapping()))
+    skip = {"1:1", "1:2", "1:3", "112:1"}  # everything except 112:2
+    for _ in range(10):
+        ayah = bot.pick_ayah(skip=skip)
+        assert (ayah["surah"], ayah["ayah"]) == (112, 2)
+
+
 # ---------- hadith selection ----------
 
 def test_hadith_filtering(monkeypatch):
@@ -135,9 +143,17 @@ def test_hadith_muslim_reference_format(monkeypatch):
     monkeypatch.setattr(bot, "get_json", fake_get_json({"eng-muslim": load("hadith_muslim.json")}))
     candidates = bot.hadith_candidates()
     assert len(candidates) == 2
-    for c in candidates:
-        assert c["ref"].startswith("Sahih Muslim, Book ")
-        assert c["link"] is None
+    by_key = {c["key"]: c for c in candidates}
+    assert by_key["muslim:2564"]["ref"] == "Sahih Muslim, Book 45, Hadith 42"
+    assert by_key["muslim:2564"]["link"] == "https://sunnah.com/muslim/45/42"
+    assert by_key["muslim:2699"]["link"] == "https://sunnah.com/muslim/48/11"
+
+
+def test_hadith_skips_recently_sent(monkeypatch):
+    monkeypatch.setattr(bot.random, "choice", lambda seq: "muslim" if "muslim" in seq else seq[0])
+    monkeypatch.setattr(bot, "get_json", fake_get_json({"eng-muslim": load("hadith_muslim.json")}))
+    candidates = bot.hadith_candidates(skip={"muslim:2564"})
+    assert [c["key"] for c in candidates] == ["muslim:2699"]
 
 
 def test_hadith_raises_when_nothing_eligible(monkeypatch):
@@ -258,3 +274,81 @@ def test_build_messages_raises_if_base_text_is_too_long():
     hadith = dict(HADITHS[0], text="x" * 5000)  # bypasses the normal 1200-char cap
     with pytest.raises(ValueError, match="exceeds Telegram limit"):
         bot.build_messages(AYAH, hadith, GOOD)
+
+
+# ---------- no-repeat history ----------
+
+def test_load_history_missing_or_corrupt_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "HISTORY_FILE", str(tmp_path / "history.json"))
+    assert bot.load_history() == {"ayahs": {}, "hadiths": {}}
+    (tmp_path / "history.json").write_text("{not json")
+    assert bot.load_history() == {"ayahs": {}, "hadiths": {}}
+
+
+def test_history_round_trip_and_pruning(tmp_path, monkeypatch):
+    import datetime
+    path = tmp_path / "history.json"
+    monkeypatch.setattr(bot, "HISTORY_FILE", str(path))
+    expired = (datetime.date.today() - datetime.timedelta(days=bot.HISTORY_DAYS + 10)).isoformat()
+    path.write_text(json.dumps({"ayahs": {"9:9": expired}, "hadiths": {"bukhari:1": expired}}))
+    history = bot.load_history()
+    assert history == {"ayahs": {}, "hadiths": {}}  # expired entries are pruned
+    bot.save_history(history, "2:255", "muslim:2564")
+    history = bot.load_history()
+    assert set(history["ayahs"]) == {"2:255"}
+    assert set(history["hadiths"]) == {"muslim:2564"}
+
+
+# ---------- dataset cache ----------
+
+def test_get_dataset_uses_local_cache(tmp_path, monkeypatch):
+    monkeypatch.setenv("DATA_DIR", str(tmp_path))
+    calls = []
+
+    def fake(url, **kw):
+        calls.append(url)
+        return {"quran": []}
+
+    monkeypatch.setattr(bot, "get_json", fake)
+    assert bot.get_dataset("https://example.com/x/edition.json") == {"quran": []}
+    assert bot.get_dataset("https://example.com/x/edition.json") == {"quran": []}
+    assert len(calls) == 1  # second call was served from the cache file
+    (tmp_path / "edition.json").write_text("{corrupt")
+    assert bot.get_dataset("https://example.com/x/edition.json") == {"quran": []}
+    assert len(calls) == 2  # corrupted cache is refetched and rewritten
+
+
+# ---------- end to end ----------
+
+def _stub_pipeline(monkeypatch):
+    hadiths = [dict(h, key=f"bukhari:{i}") for i, h in enumerate(HADITHS)]
+    monkeypatch.setattr(bot, "pick_ayah", lambda skip=frozenset(): dict(AYAH))
+    monkeypatch.setattr(bot, "hadith_candidates", lambda skip=frozenset(): hadiths)
+    monkeypatch.setattr(bot, "safe_reflect", lambda a, h: dict(GOOD))
+
+
+def test_main_records_history_after_sending(tmp_path, monkeypatch):
+    monkeypatch.setattr(bot, "HISTORY_FILE", str(tmp_path / "history.json"))
+    monkeypatch.delenv("DRY_RUN", raising=False)
+    _stub_pipeline(monkeypatch)
+    sent = []
+    monkeypatch.setattr(bot, "send", sent.append)
+    bot.main()
+    assert len(sent) == 2
+    history = bot.load_history()
+    assert set(history["ayahs"]) == {"1:1"}
+    assert set(history["hadiths"]) == {"bukhari:2"}  # GOOD picks index 2
+
+
+def test_main_dry_run_sends_nothing_and_writes_no_history(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(bot, "HISTORY_FILE", str(tmp_path / "history.json"))
+    monkeypatch.setenv("DRY_RUN", "1")
+    _stub_pipeline(monkeypatch)
+
+    def no_send(m):
+        raise AssertionError("send() must not be called in dry run")
+
+    monkeypatch.setattr(bot, "send", no_send)
+    bot.main()
+    assert "Ayah of the day" in capsys.readouterr().out
+    assert not (tmp_path / "history.json").exists()
