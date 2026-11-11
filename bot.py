@@ -53,12 +53,12 @@ TELEGRAM_LIMIT = 4096
 FALLBACK = "Reflection unavailable today."
 
 
-def get_json(url, data=None, headers=None, attempts=3, base_delay=2):
+def get_json(url, data=None, headers=None, attempts=3, base_delay=2, timeout=60):
     """GET/POST a JSON url, retrying with exponential backoff."""
     for attempt in range(attempts):
         try:
             req = urllib.request.Request(url, data=data, headers=headers or {})
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8"))
         except Exception:
             if attempt == attempts - 1:
@@ -187,10 +187,11 @@ def reflect(ayah, hadiths):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     last_err = None
     for _ in range(2):  # one retry if the output doesn't validate
-        # the free tier rate-limits aggressively, so back off slowly on 429s
+        # the free tier rate-limits aggressively (hence the slow backoff), and
+        # current "thinking" models often need well over 60s to respond
         resp = get_json(url, data=body, headers={
             "Content-Type": "application/json", "x-goog-api-key": api_key},
-            attempts=4, base_delay=10)
+            attempts=3, base_delay=10, timeout=240)
         try:
             text = resp["candidates"][0]["content"]["parts"][0]["text"]
             return validate_reflection(json.loads(text), len(hadiths))

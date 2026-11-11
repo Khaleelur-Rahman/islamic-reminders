@@ -8,7 +8,9 @@ on:
 jobs:
   send:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # must outlast the worst case of slow Gemini retries (bot.py reflect()),
+    # or the job gets killed before the no-AI fallback can send the texts
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
