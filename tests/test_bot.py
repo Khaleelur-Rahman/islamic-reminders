@@ -220,7 +220,7 @@ def test_build_messages_structure_and_links():
     assert AYAH["arabic"] in msg1 and AYAH["translation"] in msg1
     assert '<a href="https://sunnah.com/bukhari:3">' in msg2
     assert HADITHS[3]["text"] in msg2
-    assert "AI-generated" in msg2
+    assert "AI-generated" not in msg2
 
 
 def test_build_messages_without_link_has_no_anchor():

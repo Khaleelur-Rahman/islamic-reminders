@@ -137,6 +137,9 @@ of authentic hadith. Do the following:
 Rules:
 - Do NOT quote, re-translate or paraphrase the ayah or hadith text itself;
   it is shown to the reader separately.
+- Write in simple, everyday English that a 10-year-old could understand:
+  short sentences, common words, no scholarly or complicated vocabulary.
+  If you must use an Arabic or technical term, explain it in plain words.
 - No fatwas or rulings. Keep it humble, warm and practical. Plain text, no markdown.
 
 Return JSON only:
@@ -246,10 +249,7 @@ def build_messages(ayah, hadith, r):
             f"<i>{e(hadith['text'])}</i>"
         )
         if reflection:
-            msg += (
-                f"\n\n💡 <b>Reflection</b>\n{e(reflection)}\n\n"
-                f"<span class=\"tg-spoiler\">Reflections are AI-generated; verify with a scholar.</span>"
-            )
+            msg += f"\n\n💡 <b>Reflection</b>\n{e(reflection)}"
         return msg
 
     return [_clamp(msg1, r["ayah_reflection"]), _clamp(msg2, r["hadith_reflection"])]
