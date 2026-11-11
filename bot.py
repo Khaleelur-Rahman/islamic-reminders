@@ -7,7 +7,8 @@ short AI reflection on how to apply it in daily life.
 
 The Quran text, translation and hadith text are copied verbatim from the
 data sources below. The AI only writes the reflection, and it is given
-the tafsir (Ibn Kathir) as grounding.
+the tafsir (Ibn Kathir) as grounding. If the AI fails even after retries,
+the sacred texts are still sent with a "reflection unavailable" line.
 
 Data (free, no API key, served from GitHub):
   - Quran Arabic + translation: github.com/fawazahmed0/quran-api
@@ -27,6 +28,7 @@ import html
 import json
 import os
 import random
+import time
 import urllib.request
 
 RAW = "https://raw.githubusercontent.com"
@@ -43,14 +45,25 @@ HADITH_COLLECTIONS = {
                                               # Heart-Melting, Repentance, Zuhd
 }
 HADITH_CANDIDATES = 8          # the AI picks the most practical one from these
+MIN_HADITH_CHARS = 120         # skip stubs and bare chain references
 MAX_HADITH_CHARS = 1200        # skip very long narrations
 MAX_TAFSIR_CHARS = 6000        # keep the prompt small
+MAX_AYAH_CHARS = 3000          # Arabic + translation combined, so the message fits
+TELEGRAM_LIMIT = 4096
+FALLBACK = "Reflection unavailable today."
 
 
-def get_json(url, data=None, headers=None):
-    req = urllib.request.Request(url, data=data, headers=headers or {})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return json.loads(r.read().decode("utf-8"))
+def get_json(url, data=None, headers=None, attempts=3, base_delay=2):
+    """GET/POST a JSON url, retrying with exponential backoff."""
+    for attempt in range(attempts):
+        try:
+            req = urllib.request.Request(url, data=data, headers=headers or {})
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(base_delay * (2 ** attempt))
 
 
 # ---------- data ----------
@@ -58,17 +71,24 @@ def get_json(url, data=None, headers=None):
 def pick_ayah():
     translation = get_json(QURAN_TRANSLATION)["quran"]
     arabic = get_json(QURAN_ARABIC)["quran"]
-    i = random.randrange(len(translation))
-    s, a = translation[i]["chapter"], translation[i]["verse"]
+    if len(translation) != len(arabic):
+        raise RuntimeError("Quran editions are misaligned (different ayah counts)")
+    eligible = [i for i in range(len(translation))
+                if len(arabic[i]["text"]) + len(translation[i]["text"]) <= MAX_AYAH_CHARS]
+    i = random.choice(eligible)
+    t, a = translation[i], arabic[i]
+    if (t["chapter"], t["verse"]) != (a["chapter"], a["verse"]):
+        raise RuntimeError(f"Quran editions are misaligned at index {i}")
+    s, v = t["chapter"], t["verse"]
     try:
-        tafsir = get_json(TAFSIR.format(s=s, a=a))["text"][:MAX_TAFSIR_CHARS]
+        tafsir = get_json(TAFSIR.format(s=s, a=v))["text"][:MAX_TAFSIR_CHARS]
     except Exception:
         tafsir = ""
     return {
         "surah": s,
-        "ayah": a,
-        "arabic": arabic[i]["text"],
-        "translation": translation[i]["text"],
+        "ayah": v,
+        "arabic": a["text"],
+        "translation": t["text"],
         "tafsir": tafsir,
     }
 
@@ -82,10 +102,12 @@ def hadith_candidates():
     hadiths = [
         h for h in get_json(url)["hadiths"]
         if h["reference"]["book"] in books
-        and 120 < len(h["text"].strip()) <= MAX_HADITH_CHARS
+        and MIN_HADITH_CHARS < len(h["text"].strip()) <= MAX_HADITH_CHARS
         and not any(m in h["text"].lower() for m in fragment_markers)
     ]
-    picks = random.sample(hadiths, HADITH_CANDIDATES)
+    if not hadiths:
+        raise RuntimeError(f"no eligible hadith found in {name}")
+    picks = random.sample(hadiths, min(HADITH_CANDIDATES, len(hadiths)))
     out = []
     for h in picks:
         if key == "bukhari":
@@ -132,11 +154,29 @@ HADITH LIST:
 """
 
 
+def validate_reflection(result, n_hadiths):
+    """Return a cleaned reflection dict, or raise ValueError if the AI output is unusable."""
+    if not isinstance(result, dict):
+        raise ValueError("AI output is not a JSON object")
+    idx = result.get("hadith_index")
+    if isinstance(idx, bool) or not isinstance(idx, int) or not 0 <= idx < n_hadiths:
+        raise ValueError(f"hadith_index out of range: {idx!r}")
+    out = {"hadith_index": idx}
+    for key in ("ayah_reflection", "hadith_reflection"):
+        v = result.get(key)
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(f"{key} is missing or empty")
+        out[key] = v.strip()
+    return out
+
+
 def reflect(ayah, hadiths):
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        return {"hadith_index": 0, "ayah_reflection": "(AI skipped: no GEMINI_API_KEY)",
-                "hadith_reflection": "(AI skipped: no GEMINI_API_KEY)"}
+        if os.environ.get("DRY_RUN"):
+            return {"hadith_index": 0, "ayah_reflection": "(AI skipped: no GEMINI_API_KEY)",
+                    "hadith_reflection": "(AI skipped: no GEMINI_API_KEY)"}
+        raise RuntimeError("GEMINI_API_KEY is not set")
     model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
     hadith_list = "\n\n".join(f"[{i}] ({h['ref']}) {h['text']}" for i, h in enumerate(hadiths))
     prompt = PROMPT.format(hadith_list=hadith_list, **ayah)
@@ -145,42 +185,73 @@ def reflect(ayah, hadiths):
         "generationConfig": {"responseMimeType": "application/json", "temperature": 0.6},
     }).encode()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    resp = get_json(url, data=body, headers={
-        "Content-Type": "application/json", "x-goog-api-key": api_key})
-    text = resp["candidates"][0]["content"]["parts"][0]["text"]
-    result = json.loads(text)
-    idx = result.get("hadith_index", 0)
-    if not isinstance(idx, int) or not 0 <= idx < len(hadiths):
-        result["hadith_index"] = 0
-    return result
+    last_err = None
+    for _ in range(2):  # one retry if the output doesn't validate
+        # the free tier rate-limits aggressively, so back off slowly on 429s
+        resp = get_json(url, data=body, headers={
+            "Content-Type": "application/json", "x-goog-api-key": api_key},
+            attempts=4, base_delay=10)
+        try:
+            text = resp["candidates"][0]["content"]["parts"][0]["text"]
+            return validate_reflection(json.loads(text), len(hadiths))
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            last_err = e
+    raise ValueError(f"AI output failed validation twice: {last_err}")
+
+
+def safe_reflect(ayah, hadiths):
+    """Reflections, or fallbacks — a Gemini outage must not block the texts."""
+    try:
+        return reflect(ayah, hadiths)
+    except Exception as e:
+        print(f"::warning::AI reflection failed, sending fallback: {e}")
+        return {"hadith_index": 0, "ayah_reflection": FALLBACK, "hadith_reflection": FALLBACK}
 
 
 # ---------- Telegram ----------
 
+def _clamp(make_msg, reflection):
+    """Shorten the reflection until the built message fits Telegram's limit."""
+    msg = make_msg(reflection)
+    while len(msg) > TELEGRAM_LIMIT and reflection:
+        cut = len(msg) - TELEGRAM_LIMIT + 1
+        reflection = "" if cut >= len(reflection) else reflection[:-cut].rstrip() + "…"
+        msg = make_msg(reflection)
+    if len(msg) > TELEGRAM_LIMIT:
+        raise ValueError("message exceeds Telegram limit even without the reflection")
+    return msg
+
+
 def build_messages(ayah, hadith, r):
     e = lambda s: html.escape(s, quote=False)
     quran_url = f"https://quran.com/{ayah['surah']}/{ayah['ayah']}"
-    msg1 = (
-        f"📖 <b>Ayah of the day</b> — <a href=\"{quran_url}\">Surah {ayah['surah']}:{ayah['ayah']}</a>\n\n"
-        f"{e(ayah['arabic'])}\n\n"
-        f"<i>{e(ayah['translation'])}</i>\n"
-        f"— Saheeh International\n\n"
-        f"💡 <b>Reflection</b>\n{e(r['ayah_reflection'])}"
-    )
+
+    def msg1(reflection):
+        return (
+            f"📖 <b>Ayah of the day</b> — <a href=\"{quran_url}\">Surah {ayah['surah']}:{ayah['ayah']}</a>\n\n"
+            f"{e(ayah['arabic'])}\n\n"
+            f"<i>{e(ayah['translation'])}</i>\n"
+            f"— Saheeh International\n\n"
+            f"💡 <b>Reflection</b>\n{e(reflection)}"
+        )
+
     ref = f"<a href=\"{hadith['link']}\">{e(hadith['ref'])}</a>" if hadith["link"] else e(hadith["ref"])
-    msg2 = (
-        f"🕌 <b>Hadith of the day</b> — {ref}\n\n"
-        f"<i>{e(hadith['text'])}</i>\n\n"
-        f"💡 <b>Reflection</b>\n{e(r['hadith_reflection'])}\n\n"
-        f"<span class=\"tg-spoiler\">Reflections are AI-generated; verify with a scholar.</span>"
-    )
-    return [msg1, msg2]
+
+    def msg2(reflection):
+        return (
+            f"🕌 <b>Hadith of the day</b> — {ref}\n\n"
+            f"<i>{e(hadith['text'])}</i>\n\n"
+            f"💡 <b>Reflection</b>\n{e(reflection)}\n\n"
+            f"<span class=\"tg-spoiler\">Reflections are AI-generated; verify with a scholar.</span>"
+        )
+
+    return [_clamp(msg1, r["ayah_reflection"]), _clamp(msg2, r["hadith_reflection"])]
 
 
 def send(text):
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
-    body = json.dumps({"chat_id": chat_id, "text": text[:4096], "parse_mode": "HTML",
+    body = json.dumps({"chat_id": chat_id, "text": text, "parse_mode": "HTML",
                        "disable_web_page_preview": True}).encode()
     get_json(f"https://api.telegram.org/bot{token}/sendMessage", data=body,
              headers={"Content-Type": "application/json"})
@@ -189,7 +260,9 @@ def send(text):
 def main():
     ayah = pick_ayah()
     hadiths = hadith_candidates()
-    r = reflect(ayah, hadiths)
+    r = safe_reflect(ayah, hadiths)
+    # build (and validate) both messages before sending either, so a bad
+    # message fails the run instead of sending half the reminder
     messages = build_messages(ayah, hadiths[r["hadith_index"]], r)
     for m in messages:
         if os.environ.get("DRY_RUN"):
