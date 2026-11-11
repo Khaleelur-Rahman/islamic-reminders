@@ -25,7 +25,7 @@ Telegram Bot API (delivery). No server, no database, Python stdlib only.
 
 After that the schedule (23:00 UTC = 7:00 AM SGT, sometimes 5–15 min late)
 runs on its own. A failed run shows up as a failed Action; if only Gemini
-fails, the texts are still sent with a "reflection unavailable today" line.
+fails, the texts are still sent, just without the reflection sections.
 
 ## Local testing
 

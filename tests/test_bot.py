@@ -187,17 +187,20 @@ def test_reflect_gives_up_after_two_bad_outputs(monkeypatch):
         bot.reflect(AYAH, HADITHS)
 
 
-def test_safe_reflect_falls_back_on_total_failure(monkeypatch):
+def test_safe_reflect_omits_reflections_on_total_failure(monkeypatch):
     def boom(ayah, hadiths):
         raise ConnectionError("Gemini is down")
     monkeypatch.setattr(bot, "reflect", boom)
     r = bot.safe_reflect(AYAH, HADITHS)
-    assert r == {"hadith_index": 0, "ayah_reflection": bot.FALLBACK,
-                 "hadith_reflection": bot.FALLBACK}
-    # the fallback still produces two valid messages
-    messages = bot.build_messages(AYAH, HADITHS[0], r)
-    assert len(messages) == 2
-    assert all(bot.FALLBACK in m for m in messages)
+    assert r == {"hadith_index": 0, "ayah_reflection": None, "hadith_reflection": None}
+    # the texts still go out, just without the reflection sections
+    msg1, msg2 = bot.build_messages(AYAH, HADITHS[0], r)
+    assert AYAH["arabic"] in msg1 and AYAH["translation"] in msg1
+    assert HADITHS[0]["text"] in msg2
+    for m in (msg1, msg2):
+        assert "Reflection" not in m
+        assert "💡" not in m
+        assert "AI-generated" not in m
 
 
 # ---------- message building ----------

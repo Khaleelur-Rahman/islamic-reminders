@@ -8,7 +8,7 @@ short AI reflection on how to apply it in daily life.
 The Quran text, translation and hadith text are copied verbatim from the
 data sources below. The AI only writes the reflection, and it is given
 the tafsir (Ibn Kathir) as grounding. If the AI fails even after retries,
-the sacred texts are still sent with a "reflection unavailable" line.
+the sacred texts are still sent, just without the reflection sections.
 
 Data (free, no API key, served from GitHub):
   - Quran Arabic + translation: github.com/fawazahmed0/quran-api
@@ -50,7 +50,6 @@ MAX_HADITH_CHARS = 1200        # skip very long narrations
 MAX_TAFSIR_CHARS = 6000        # keep the prompt small
 MAX_AYAH_CHARS = 3000          # Arabic + translation combined, so the message fits
 TELEGRAM_LIMIT = 4096
-FALLBACK = "Reflection unavailable today."
 
 
 def get_json(url, data=None, headers=None, attempts=3, base_delay=2, timeout=60):
@@ -201,18 +200,19 @@ def reflect(ayah, hadiths):
 
 
 def safe_reflect(ayah, hadiths):
-    """Reflections, or fallbacks — a Gemini outage must not block the texts."""
+    """Reflections, or none — a Gemini outage must not block the texts."""
     try:
         return reflect(ayah, hadiths)
     except Exception as e:
-        print(f"::warning::AI reflection failed, sending fallback: {e}")
-        return {"hadith_index": 0, "ayah_reflection": FALLBACK, "hadith_reflection": FALLBACK}
+        print(f"::warning::AI reflection failed, sending texts without reflections: {e}")
+        return {"hadith_index": 0, "ayah_reflection": None, "hadith_reflection": None}
 
 
 # ---------- Telegram ----------
 
 def _clamp(make_msg, reflection):
     """Shorten the reflection until the built message fits Telegram's limit."""
+    reflection = reflection or ""
     msg = make_msg(reflection)
     while len(msg) > TELEGRAM_LIMIT and reflection:
         cut = len(msg) - TELEGRAM_LIMIT + 1
@@ -228,23 +228,29 @@ def build_messages(ayah, hadith, r):
     quran_url = f"https://quran.com/{ayah['surah']}/{ayah['ayah']}"
 
     def msg1(reflection):
-        return (
+        msg = (
             f"📖 <b>Ayah of the day</b> — <a href=\"{quran_url}\">Surah {ayah['surah']}:{ayah['ayah']}</a>\n\n"
             f"{e(ayah['arabic'])}\n\n"
             f"<i>{e(ayah['translation'])}</i>\n"
-            f"— Saheeh International\n\n"
-            f"💡 <b>Reflection</b>\n{e(reflection)}"
+            f"— Saheeh International"
         )
+        if reflection:
+            msg += f"\n\n💡 <b>Reflection</b>\n{e(reflection)}"
+        return msg
 
     ref = f"<a href=\"{hadith['link']}\">{e(hadith['ref'])}</a>" if hadith["link"] else e(hadith["ref"])
 
     def msg2(reflection):
-        return (
+        msg = (
             f"🕌 <b>Hadith of the day</b> — {ref}\n\n"
-            f"<i>{e(hadith['text'])}</i>\n\n"
-            f"💡 <b>Reflection</b>\n{e(reflection)}\n\n"
-            f"<span class=\"tg-spoiler\">Reflections are AI-generated; verify with a scholar.</span>"
+            f"<i>{e(hadith['text'])}</i>"
         )
+        if reflection:
+            msg += (
+                f"\n\n💡 <b>Reflection</b>\n{e(reflection)}\n\n"
+                f"<span class=\"tg-spoiler\">Reflections are AI-generated; verify with a scholar.</span>"
+            )
+        return msg
 
     return [_clamp(msg1, r["ayah_reflection"]), _clamp(msg2, r["hadith_reflection"])]
 
