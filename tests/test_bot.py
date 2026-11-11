@@ -38,6 +38,22 @@ def quran_mapping(translation=None, arabic=None, tafsir=None):
     }
 
 
+# ---------- http helper ----------
+
+def test_get_json_reports_http_error_body(monkeypatch):
+    import io
+    import urllib.error
+
+    def fake_urlopen(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests",
+                                     {}, io.BytesIO(b'{"error": "quota exceeded"}'))
+
+    monkeypatch.setattr(bot.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(bot.time, "sleep", lambda s: None)
+    with pytest.raises(RuntimeError, match=r"HTTP 429 from example\.com.*quota exceeded"):
+        bot.get_json("https://example.com/secret-token/path", attempts=2)
+
+
 # ---------- ayah selection ----------
 
 def test_pick_ayah_returns_verbatim_aligned_texts(monkeypatch):

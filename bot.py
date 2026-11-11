@@ -19,7 +19,7 @@ Environment variables:
   TELEGRAM_BOT_TOKEN  from @BotFather
   TELEGRAM_CHAT_ID    your chat id
   GEMINI_API_KEY      from aistudio.google.com (free tier)
-  GEMINI_MODEL        optional, default "gemini-flash-latest"
+  GEMINI_MODEL        optional, default "gemini-flash-lite-latest"
   DRY_RUN=1           optional: print the message instead of sending it,
                       and skip the AI call if GEMINI_API_KEY is unset
 """
@@ -29,6 +29,8 @@ import json
 import os
 import random
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 
 RAW = "https://raw.githubusercontent.com"
@@ -54,14 +56,22 @@ TELEGRAM_LIMIT = 4096
 
 def get_json(url, data=None, headers=None, attempts=3, base_delay=2, timeout=60):
     """GET/POST a JSON url, retrying with exponential backoff."""
+    host = urllib.parse.urlsplit(url).netloc  # never log the URL path: it may hold a token
     for attempt in range(attempts):
         try:
             req = urllib.request.Request(url, data=data, headers=headers or {})
             with urllib.request.urlopen(req, timeout=timeout) as r:
                 return json.loads(r.read().decode("utf-8"))
-        except Exception:
+        except Exception as err:
+            if isinstance(err, urllib.error.HTTPError):
+                try:
+                    body = err.read().decode("utf-8", "replace")[:300]
+                except Exception:
+                    body = ""
+                err = RuntimeError(f"HTTP {err.code} from {host}: {body}")
             if attempt == attempts - 1:
-                raise
+                raise err
+            print(f"{host}: attempt {attempt + 1}/{attempts} failed ({err}); retrying")
             time.sleep(base_delay * (2 ** attempt))
 
 
@@ -179,12 +189,15 @@ def reflect(ayah, hadiths):
             return {"hadith_index": 0, "ayah_reflection": "(AI skipped: no GEMINI_API_KEY)",
                     "hadith_reflection": "(AI skipped: no GEMINI_API_KEY)"}
         raise RuntimeError("GEMINI_API_KEY is not set")
-    model = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+    # the lite tier has "thinking" off by default; the full flash models think
+    # by default and routinely blew through even a 240s read timeout here
+    model = os.environ.get("GEMINI_MODEL", "gemini-flash-lite-latest")
     hadith_list = "\n\n".join(f"[{i}] ({h['ref']}) {h['text']}" for i, h in enumerate(hadiths))
     prompt = PROMPT.format(hadith_list=hadith_list, **ayah)
     body = json.dumps({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.6},
+        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.6,
+                             "maxOutputTokens": 2048},
     }).encode()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     last_err = None
